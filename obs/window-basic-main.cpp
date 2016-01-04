@@ -905,7 +905,7 @@ void OBSBasic::OBSInit()
 			"_fade_transition", NULL, NULL);
 	obs_set_output_source(0, transition);
 
-	signalHandlers.emplace_back(obs_source_get_signal_handler(transition),
+	signal_handler_connect(obs_source_get_signal_handler(transition),
 			"transition_start", OBSBasic::TransitionStarted, this);
 
 	obs_source_release(transition);
@@ -1203,6 +1203,11 @@ OBSBasic::~OBSBasic()
 		}
 	}
 #endif
+
+	/* release transition */
+	signal_handler_disconnect(obs_source_get_signal_handler(transition),
+			"transition_start", OBSBasic::TransitionStarted, this);
+	obs_set_output_source(0, NULL);
 }
 
 void OBSBasic::SaveProjectNow()

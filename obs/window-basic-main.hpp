@@ -192,6 +192,8 @@ private:
 	obs_hotkey_pair_id streamingHotkeys, recordingHotkeys;
 	obs_hotkey_id forceStreamingStopHotkey;
 
+	obs_source_t *transition;
+
 public slots:
 	void StartStreaming();
 	void StopStreaming();
