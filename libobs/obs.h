@@ -1,5 +1,5 @@
 /******************************************************************************
-    Copyright (C) 2013-2014 by Hugh Bailey <obs.jim@gmail.com>
+    Copyright (C) 2013-2014 by Hugh Bailey <jim@obsproject.com>
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -180,7 +180,6 @@ struct obs_video_info {
 struct obs_audio_info {
 	uint32_t            samples_per_sec;
 	enum speaker_layout speakers;
-	uint64_t            buffer_ms;
 };
 
 /**
@@ -233,6 +232,7 @@ struct obs_source_frame {
 
 	/* used internally by libobs */
 	volatile long       refs;
+	bool                prev_frame;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -415,6 +415,9 @@ EXPORT char *obs_find_module_file(obs_module_t *module, const char *file);
  */
 EXPORT char *obs_module_get_config_path(obs_module_t *module, const char *file);
 
+/** Enumerates all source types (inputs, filters, transitions, etc).  */
+EXPORT bool obs_enum_source_types(size_t idx, const char **id);
+
 /**
  * Enumerates all available inputs source types.
  *
@@ -518,6 +521,7 @@ enum obs_base_effect {
 	OBS_EFFECT_BICUBIC,            /**< Bicubic downscale */
 	OBS_EFFECT_LANCZOS,            /**< Lanczos downscale */
 	OBS_EFFECT_BILINEAR_LOWRES,    /**< Bilinear low resolution downscale */
+	OBS_EFFECT_PREMULTIPLIED_ALPHA,/**< Premultiplied alpha */
 };
 
 /** Returns a commonly used base effect */
@@ -539,14 +543,8 @@ EXPORT void obs_render_main_view(void);
 /** Sets the master user volume */
 EXPORT void obs_set_master_volume(float volume);
 
-/** Sets the master presentation volume */
-EXPORT void obs_set_present_volume(float volume);
-
 /** Gets the master user volume */
 EXPORT float obs_get_master_volume(void);
-
-/** Gets the master presentation volume */
-EXPORT float obs_get_present_volume(void);
 
 /** Saves a source to settings data */
 EXPORT obs_data_t *obs_save_source(obs_source_t *source);
@@ -554,8 +552,11 @@ EXPORT obs_data_t *obs_save_source(obs_source_t *source);
 /** Loads a source from settings data */
 EXPORT obs_source_t *obs_load_source(obs_data_t *data);
 
+typedef void (*obs_load_source_cb)(void *private_data, obs_source_t *source);
+
 /** Loads sources from a data array */
-EXPORT void obs_load_sources(obs_data_array_t *array);
+EXPORT void obs_load_sources(obs_data_array_t *array, obs_load_source_cb cb,
+		void *private_data);
 
 /** Saves sources to a data array */
 EXPORT obs_data_array_t *obs_save_sources(void);
@@ -563,6 +564,18 @@ EXPORT obs_data_array_t *obs_save_sources(void);
 typedef bool (*obs_save_source_filter_cb)(void *data, obs_source_t *source);
 EXPORT obs_data_array_t *obs_save_sources_filtered(obs_save_source_filter_cb cb,
 		void *data);
+
+enum obs_obj_type {
+	OBS_OBJ_TYPE_INVALID,
+	OBS_OBJ_TYPE_SOURCE,
+	OBS_OBJ_TYPE_OUTPUT,
+	OBS_OBJ_TYPE_ENCODER,
+	OBS_OBJ_TYPE_SERVICE
+};
+
+EXPORT enum obs_obj_type obs_obj_get_type(void *obj);
+EXPORT const char *obs_obj_get_id(void *obj);
+EXPORT bool obs_obj_invalid(void *obj);
 
 
 /* ------------------------------------------------------------------------- */
@@ -589,6 +602,8 @@ EXPORT obs_source_t *obs_view_get_source(obs_view_t *view,
 
 /** Renders the sources of this view context */
 EXPORT void obs_view_render(obs_view_t *view);
+
+EXPORT uint64_t obs_get_video_frame_time(void);
 
 
 /* ------------------------------------------------------------------------- */
@@ -639,8 +654,7 @@ EXPORT void obs_display_set_background_color(obs_display_t *display,
 /* Sources */
 
 /** Returns the translated display name of a source */
-EXPORT const char *obs_source_get_display_name(enum obs_source_type type,
-		const char *id);
+EXPORT const char *obs_source_get_display_name(const char *id);
 
 /**
  * Creates a source of the specified type with the specified settings.
@@ -648,10 +662,16 @@ EXPORT const char *obs_source_get_display_name(enum obs_source_type type,
  *   The "source" context is used for anything related to presenting
  * or modifying video/audio.  Use obs_source_release to release it.
  */
-EXPORT obs_source_t *obs_source_create(enum obs_source_type type,
-		const char *id, const char *name, obs_data_t *settings,
-		obs_data_t *hotkey_data);
+EXPORT obs_source_t *obs_source_create(const char *id, const char *name,
+		obs_data_t *settings, obs_data_t *hotkey_data);
 
+EXPORT obs_source_t *obs_source_create_private(const char *id,
+		const char *name, obs_data_t *settings);
+
+/* if source has OBS_SOURCE_DO_NOT_DUPLICATE output flag set, only returns a
+ * reference */
+EXPORT obs_source_t *obs_source_duplicate(obs_source_t *source,
+		const char *desired_name, bool create_private);
 /**
  * Adds/releases a reference to a source.  When the last reference is
  * released, the source is destroyed.
@@ -679,16 +699,18 @@ EXPORT bool obs_source_removed(const obs_source_t *source);
 EXPORT uint32_t obs_source_get_output_flags(const obs_source_t *source);
 
 /** Returns capability flags of a source type */
-EXPORT uint32_t obs_get_source_output_flags(enum obs_source_type type,
-		const char *id);
+EXPORT uint32_t obs_get_source_output_flags(const char *id);
 
 /** Gets the default settings for a source type */
-EXPORT obs_data_t *obs_get_source_defaults(enum obs_source_type type,
-		const char *id);
+EXPORT obs_data_t *obs_get_source_defaults(const char *id);
 
 /** Returns the property list, if any.  Free with obs_properties_destroy */
-EXPORT obs_properties_t *obs_get_source_properties(enum obs_source_type type,
-		const char *id);
+EXPORT obs_properties_t *obs_get_source_properties(const char *id);
+
+/** Returns whether the source has custom properties or not */
+EXPORT bool obs_is_source_configurable(const char *id);
+
+EXPORT bool obs_source_configurable(const obs_source_t *source);
 
 /**
  * Returns the properties list for a specific existing source.  Free with
@@ -758,14 +780,8 @@ EXPORT proc_handler_t *obs_source_get_proc_handler(const obs_source_t *source);
 /** Sets the user volume for a source that has audio output */
 EXPORT void obs_source_set_volume(obs_source_t *source, float volume);
 
-/** Sets the presentation volume for a source */
-EXPORT void obs_source_set_present_volume(obs_source_t *source, float volume);
-
 /** Gets the user volume for a source that has audio output */
 EXPORT float obs_source_get_volume(const obs_source_t *source);
-
-/** Gets the presentation volume for a source */
-EXPORT float obs_source_get_present_volume(const obs_source_t *source);
 
 /** Sets the audio sync offset (in nanoseconds) for a source */
 EXPORT void obs_source_set_sync_offset(obs_source_t *source, int64_t offset);
@@ -790,22 +806,6 @@ EXPORT bool obs_source_active(const obs_source_t *source);
  * Returns true if currently displayed somewhere (active or not), false if not
  */
 EXPORT bool obs_source_showing(const obs_source_t *source);
-
-/**
- * Sometimes sources need to be told when to save their settings so they
- * don't have to constantly update and keep track of their settings.  This will
- * call the source's 'save' callback if any, which will save its current
- * data to its settings.
- */
-EXPORT void obs_source_save(obs_source_t *source);
-
-/**
- * Sometimes sources need to be told when they are loading their settings
- * from prior saved data.  This is different from a source 'update' in that
- * it's meant to be used after the source has been created and loaded from
- * somewhere (such as a saved file).
- */
-EXPORT void obs_source_load(obs_source_t *source);
 
 /** Specifies that async video frames should be played as soon as possible */
 #define OBS_SOURCE_FLAG_UNBUFFERED             (1<<0)
@@ -873,6 +873,40 @@ EXPORT uint64_t obs_source_get_push_to_talk_delay(obs_source_t *source);
 EXPORT void obs_source_set_push_to_talk_delay(obs_source_t *source,
 		uint64_t delay);
 
+typedef void (*obs_source_audio_capture_t)(void *param, obs_source_t *source,
+		const struct audio_data *audio_data, bool muted);
+
+EXPORT void obs_source_add_audio_capture_callback(obs_source_t *source,
+		obs_source_audio_capture_t callback, void *param);
+EXPORT void obs_source_remove_audio_capture_callback(obs_source_t *source,
+		obs_source_audio_capture_t callback, void *param);
+
+enum obs_deinterlace_mode {
+	OBS_DEINTERLACE_MODE_DISABLE,
+	OBS_DEINTERLACE_MODE_DISCARD,
+	OBS_DEINTERLACE_MODE_RETRO,
+	OBS_DEINTERLACE_MODE_BLEND,
+	OBS_DEINTERLACE_MODE_BLEND_2X,
+	OBS_DEINTERLACE_MODE_LINEAR,
+	OBS_DEINTERLACE_MODE_LINEAR_2X,
+	OBS_DEINTERLACE_MODE_YADIF,
+	OBS_DEINTERLACE_MODE_YADIF_2X
+};
+
+enum obs_deinterlace_field_order {
+	OBS_DEINTERLACE_FIELD_ORDER_TOP,
+	OBS_DEINTERLACE_FIELD_ORDER_BOTTOM
+};
+
+EXPORT void obs_source_set_deinterlace_mode(obs_source_t *source,
+		enum obs_deinterlace_mode mode);
+EXPORT enum obs_deinterlace_mode obs_source_get_deinterlace_mode(
+		const obs_source_t *source);
+EXPORT void obs_source_set_deinterlace_field_order(obs_source_t *source,
+		enum obs_deinterlace_field_order field_order);
+EXPORT enum obs_deinterlace_field_order obs_source_get_deinterlace_field_order(
+		const obs_source_t *source);
+
 /* ------------------------------------------------------------------------- */
 /* Functions used by sources */
 
@@ -934,8 +968,11 @@ EXPORT void obs_source_release_frame(obs_source_t *source,
  *
  * After calling this, set your parameters for the effect, then call
  * obs_source_process_filter_end to draw the filter.
+ *
+ * Returns true if filtering should continue, false if the filter is bypassed
+ * for whatever reason.
  */
-EXPORT void obs_source_process_filter_begin(obs_source_t *filter,
+EXPORT bool obs_source_process_filter_begin(obs_source_t *filter,
 		enum gs_color_format format,
 		enum obs_allow_direct_render allow_direct);
 
@@ -948,6 +985,17 @@ EXPORT void obs_source_process_filter_begin(obs_source_t *filter,
  */
 EXPORT void obs_source_process_filter_end(obs_source_t *filter,
 		gs_effect_t *effect, uint32_t width, uint32_t height);
+
+/**
+ * Draws the filter with a specific technique.
+ *
+ * Before calling this function, first call obs_source_process_filter_begin and
+ * then set the effect parameters, and then call this function to finalize the
+ * filter.
+ */
+EXPORT void obs_source_process_filter_tech_end(obs_source_t *filter,
+		gs_effect_t *effect, uint32_t width, uint32_t height,
+		const char *tech_name);
 
 /** Skips the filter if the filter is invalid and cannot be rendered */
 EXPORT void obs_source_skip_video_filter(obs_source_t *filter);
@@ -1000,6 +1048,85 @@ EXPORT uint32_t obs_source_get_base_width(obs_source_t *source);
 /** Gets the base height for a source (not taking in to account filtering) */
 EXPORT uint32_t obs_source_get_base_height(obs_source_t *source);
 
+EXPORT bool obs_source_audio_pending(const obs_source_t *source);
+EXPORT uint64_t obs_source_get_audio_timestamp(const obs_source_t *source);
+EXPORT void obs_source_get_audio_mix(const obs_source_t *source,
+		struct obs_source_audio_mix *audio);
+
+/* ------------------------------------------------------------------------- */
+/* Transition-specific functions */
+enum obs_transition_target {
+	OBS_TRANSITION_SOURCE_A,
+	OBS_TRANSITION_SOURCE_B
+};
+
+EXPORT obs_source_t *obs_transition_get_source(obs_source_t *transition,
+		enum obs_transition_target target);
+EXPORT void obs_transition_clear(obs_source_t *transition);
+
+EXPORT obs_source_t *obs_transition_get_active_source(obs_source_t *transition);
+
+enum obs_transition_mode {
+	OBS_TRANSITION_MODE_AUTO,
+};
+
+EXPORT bool obs_transition_start(obs_source_t *transition,
+		enum obs_transition_mode mode, uint32_t duration_ms,
+		obs_source_t *dest);
+
+EXPORT void obs_transition_set(obs_source_t *transition, obs_source_t *source);
+
+enum obs_transition_scale_type {
+	OBS_TRANSITION_SCALE_MAX_ONLY,
+	OBS_TRANSITION_SCALE_ASPECT,
+	OBS_TRANSITION_SCALE_STRETCH,
+};
+
+EXPORT void obs_transition_set_scale_type(obs_source_t *transition,
+		enum obs_transition_scale_type type);
+EXPORT enum obs_transition_scale_type obs_transition_get_scale_type(
+		const obs_source_t *transition);
+
+EXPORT void obs_transition_set_alignment(obs_source_t *transition,
+		uint32_t alignment);
+EXPORT uint32_t obs_transition_get_alignment(const obs_source_t *transition);
+
+EXPORT void obs_transition_set_size(obs_source_t *transition,
+		uint32_t cx, uint32_t cy);
+EXPORT void obs_transition_get_size(const obs_source_t *transition,
+		uint32_t *cx, uint32_t *cy);
+
+/* function used by transitions */
+
+/**
+ * Enables fixed transitions (videos or specific types of transitions that
+ * are of fixed duration and linearly interpolated
+ */
+EXPORT void obs_transition_enable_fixed(obs_source_t *transition, bool enable,
+		uint32_t duration_ms);
+EXPORT bool obs_transition_fixed(obs_source_t *transition);
+
+typedef void (*obs_transition_video_render_callback_t)(void *data,
+		gs_texture_t *a, gs_texture_t *b, float t,
+		uint32_t cx, uint32_t cy);
+typedef float (*obs_transition_audio_mix_callback_t)(void *data, float t);
+
+EXPORT void obs_transition_video_render(obs_source_t *transition,
+		obs_transition_video_render_callback_t callback);
+
+EXPORT bool obs_transition_audio_render(obs_source_t *transition,
+		uint64_t *ts_out, struct obs_source_audio_mix *audio,
+		uint32_t mixers, size_t channels, size_t sample_rate,
+		obs_transition_audio_mix_callback_t mix_a_callback,
+		obs_transition_audio_mix_callback_t mix_b_callback);
+
+/* swaps transition sources and textures as an optimization and to reduce
+ * memory usage when switching between transitions */
+EXPORT void obs_transition_swap_begin(obs_source_t *tr_dest,
+		obs_source_t *tr_source);
+EXPORT void obs_transition_swap_end(obs_source_t *tr_dest,
+		obs_source_t *tr_source);
+
 
 /* ------------------------------------------------------------------------- */
 /* Scenes */
@@ -1012,13 +1139,20 @@ EXPORT uint32_t obs_source_get_base_height(obs_source_t *source);
  */
 EXPORT obs_scene_t *obs_scene_create(const char *name);
 
+EXPORT obs_scene_t *obs_scene_create_private(const char *name);
+
+enum obs_scene_duplicate_type {
+	OBS_SCENE_DUP_REFS,         /**< Source refs only */
+	OBS_SCENE_DUP_COPY,         /**< Fully duplicate */
+	OBS_SCENE_DUP_PRIVATE_REFS, /**< Source refs only (as private) */
+	OBS_SCENE_DUP_PRIVATE_COPY  /**< Fully duplicate (as private) */
+};
+
 /**
  * Duplicates a scene.
- *
- *   Sources in a scene will not be recreated; it will contain references to
- * the same sources as the originating scene.
  */
-EXPORT obs_scene_t *obs_scene_duplicate(obs_scene_t *scene, const char *name);
+EXPORT obs_scene_t *obs_scene_duplicate(obs_scene_t *scene, const char *name,
+		enum obs_scene_duplicate_type type);
 
 EXPORT void        obs_scene_addref(obs_scene_t *scene);
 EXPORT void        obs_scene_release(obs_scene_t *scene);
@@ -1106,6 +1240,21 @@ EXPORT void obs_sceneitem_get_box_transform(const obs_sceneitem_t *item,
 
 EXPORT bool obs_sceneitem_visible(const obs_sceneitem_t *item);
 EXPORT bool obs_sceneitem_set_visible(obs_sceneitem_t *item, bool visible);
+
+struct obs_sceneitem_crop {
+	int left;
+	int top;
+	int right;
+	int bottom;
+};
+
+EXPORT void obs_sceneitem_set_crop(obs_sceneitem_t *item,
+		const struct obs_sceneitem_crop *crop);
+EXPORT void obs_sceneitem_get_crop(const obs_sceneitem_t *item,
+		struct obs_sceneitem_crop *crop);
+
+EXPORT void obs_sceneitem_defer_update_begin(obs_sceneitem_t *item);
+EXPORT void obs_sceneitem_defer_update_end(obs_sceneitem_t *item);
 
 
 /* ------------------------------------------------------------------------- */
@@ -1487,6 +1636,8 @@ EXPORT void *obs_encoder_get_type_data(obs_encoder_t *encoder);
 
 EXPORT const char *obs_encoder_get_id(const obs_encoder_t *encoder);
 
+EXPORT uint32_t obs_get_encoder_caps(const char *encoder_id);
+
 /** Duplicates an encoder packet */
 EXPORT void obs_duplicate_encoder_packet(struct encoder_packet *dst,
 		const struct encoder_packet *src);
@@ -1501,6 +1652,9 @@ EXPORT const char *obs_service_get_display_name(const char *id);
 
 EXPORT obs_service_t *obs_service_create(const char *id, const char *name,
 		obs_data_t *settings, obs_data_t *hotkey_data);
+
+EXPORT obs_service_t *obs_service_create_private(const char *id,
+		const char *name, obs_data_t *settings);
 
 /**
  * Adds/releases a reference to a service.  When the last reference is

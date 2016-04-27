@@ -53,8 +53,8 @@ static const char *output_signals[] = {
 static bool init_output_handlers(struct obs_output *output, const char *name,
 		obs_data_t *settings, obs_data_t *hotkey_data)
 {
-	if (!obs_context_data_init(&output->context, settings, name,
-				hotkey_data))
+	if (!obs_context_data_init(&output->context, OBS_OBJ_TYPE_OUTPUT,
+				settings, name, hotkey_data, false))
 		return false;
 
 	signal_handler_add_array(output->context.signals, output_signals);
@@ -190,6 +190,8 @@ bool obs_output_actual_start(obs_output_t *output)
 			video_output_get_total_frames(output->video);
 		output->starting_skipped_frame_count =
 			video_output_get_skipped_frames(output->video);
+		output->starting_drawn_count = obs->video.total_frames;
+		output->starting_lagged_count = obs->video.lagged_frames;
 	}
 
 	if (output->delay_restart_refs)
@@ -222,35 +224,52 @@ bool obs_output_start(obs_output_t *output)
 
 static void log_frame_info(struct obs_output *output)
 {
+	struct obs_core_video *video = &obs->video;
+
 	uint32_t video_frames  = video_output_get_total_frames(output->video);
 	uint32_t video_skipped = video_output_get_skipped_frames(output->video);
 
 	uint32_t total   = video_frames  - output->starting_frame_count;
 	uint32_t skipped = video_skipped - output->starting_skipped_frame_count;
 
+	uint32_t drawn  = video->total_frames - output->starting_drawn_count;
+	uint32_t lagged = video->lagged_frames - output->starting_lagged_count;
+
 	int dropped = obs_output_get_frames_dropped(output);
 
-	double percentage_skipped = (double)skipped / (double)total * 100.0;
+	double percentage_skipped = 0.0f;
+	double percentage_lagged = 0.0f;
+	double percentage_dropped = 0.0f;
+
+	if (total) {
+		percentage_skipped = (double)skipped / (double)total * 100.0;
+		percentage_dropped = (double)dropped / (double)total * 100.0;
+	}
+	if (drawn)
+		percentage_lagged = (double)lagged  / (double)drawn * 100.0;
 
 	blog(LOG_INFO, "Output '%s': stopping", output->context.name);
-	blog(LOG_INFO, "Output '%s': Total frames: %"PRIu32,
+	blog(LOG_INFO, "Output '%s': Total encoded frames: %"PRIu32,
 			output->context.name, total);
+	blog(LOG_INFO, "Output '%s': Total drawn frames: %"PRIu32,
+			output->context.name, drawn);
 
-	if (total)
-		blog(LOG_INFO, "Output '%s': Number of skipped frames: "
-				"%"PRIu32" (%g%%)",
+	if (total && skipped)
+		blog(LOG_INFO, "Output '%s': Number of skipped frames due "
+				"to encoding lag: %"PRIu32" (%0.1f%%)",
 				output->context.name,
 				skipped, percentage_skipped);
-
-	if (dropped) {
-		double percentage_dropped;
-		percentage_dropped = (double)dropped / (double)total * 100.0;
-
-		blog(LOG_INFO, "Output '%s': Number of dropped frames: "
-				"%d (%g%%)",
+	if (drawn && lagged)
+		blog(LOG_INFO, "Output '%s': Number of lagged frames due "
+				"to rendering lag/stalls: %"PRIu32" (%0.1f%%)",
+				output->context.name,
+				lagged, percentage_lagged);
+	if (total && dropped)
+		blog(LOG_INFO, "Output '%s': Number of dropped frames due "
+				"to insufficient bandwidth/connection stalls: "
+				"%d (%0.1f%%)",
 				output->context.name,
 				dropped, percentage_dropped);
-	}
 }
 
 void obs_output_actual_stop(obs_output_t *output, bool force)
@@ -877,49 +896,131 @@ static inline void set_higher_ts(struct obs_output *output,
 	}
 }
 
-static bool can_prune_interleaved_packet(struct obs_output *output, size_t idx)
+static inline struct encoder_packet *find_first_packet_type(
+		struct obs_output *output, enum obs_encoder_type type,
+		size_t audio_idx);
+static int find_first_packet_type_idx(struct obs_output *output,
+		enum obs_encoder_type type, size_t audio_idx);
+
+/* gets the point where audio and video are closest together */
+static size_t get_interleaved_start_idx(struct obs_output *output)
 {
-	struct encoder_packet *packet;
-	struct encoder_packet *next;
+	int64_t closest_diff = 0x7FFFFFFFFFFFFFFFLL;
+	struct encoder_packet *first_video = find_first_packet_type(output,
+			OBS_ENCODER_VIDEO, 0);
+	size_t video_idx = DARRAY_INVALID;
+	size_t idx = 0;
 
-	if (idx >= (output->interleaved_packets.num - 1))
+	for (size_t i = 0; i < output->interleaved_packets.num; i++) {
+		struct encoder_packet *packet =
+			&output->interleaved_packets.array[i];
+		int64_t diff;
+
+		if (packet->type != OBS_ENCODER_AUDIO) {
+			if (packet == first_video)
+				video_idx = i;
+			continue;
+		}
+
+		diff = llabs(packet->dts_usec - first_video->dts_usec);
+		if (diff < closest_diff) {
+			closest_diff = diff;
+			idx = i;
+		}
+	}
+
+	return video_idx < idx ? video_idx : idx;
+}
+
+static int prune_premature_packets(struct obs_output *output)
+{
+	size_t audio_mixes = num_audio_mixes(output);
+	struct encoder_packet *video;
+	int video_idx;
+	int max_idx;
+	int64_t duration_usec;
+	int64_t max_diff = 0;
+	int64_t diff;
+
+	video_idx = find_first_packet_type_idx(output, OBS_ENCODER_VIDEO, 0);
+	if (video_idx == -1) {
+		output->received_video = false;
+		return -1;
+	}
+
+	max_idx = video_idx;
+	video = &output->interleaved_packets.array[video_idx];
+	duration_usec = video->timebase_num * 1000000LL / video->timebase_den;
+
+	for (size_t i = 0; i < audio_mixes; i++) {
+		struct encoder_packet *audio;
+		int audio_idx;
+
+		audio_idx = find_first_packet_type_idx(output,
+				OBS_ENCODER_AUDIO, i);
+		if (audio_idx == -1) {
+			output->received_audio = false;
+			return -1;
+		}
+
+		audio = &output->interleaved_packets.array[audio_idx];
+		if (audio_idx > max_idx)
+			max_idx = audio_idx;
+
+		diff = audio->dts_usec - video->dts_usec;
+		if (diff > max_diff)
+			max_diff = diff;
+	}
+
+	return diff > duration_usec ? max_idx + 1 : 0;
+}
+
+static void discard_to_idx(struct obs_output *output, size_t idx)
+{
+	for (size_t i = 0; i < idx; i++) {
+		struct encoder_packet *packet =
+			&output->interleaved_packets.array[i];
+		obs_free_encoder_packet(packet);
+	}
+
+	da_erase_range(output->interleaved_packets, 0, idx);
+}
+
+#define DEBUG_STARTING_PACKETS 0
+
+static bool prune_interleaved_packets(struct obs_output *output)
+{
+	size_t start_idx = 0;
+	int prune_start = prune_premature_packets(output);
+
+#if DEBUG_STARTING_PACKETS == 1
+	blog(LOG_DEBUG, "--------- Pruning! %d ---------", prune_start);
+	for (size_t i = 0; i < output->interleaved_packets.num; i++) {
+		struct encoder_packet *packet =
+			&output->interleaved_packets.array[i];
+		blog(LOG_DEBUG, "packet: %s %d, ts: %lld, pruned = %s",
+				packet->type == OBS_ENCODER_AUDIO ?
+				"audio" : "video", (int)packet->track_idx,
+				packet->dts_usec,
+				(int)i < prune_start ? "true" : "false");
+	}
+#endif
+
+	/* prunes the first video packet if it's too far away from audio */
+	if (prune_start == -1)
 		return false;
+	else if (prune_start != 0)
+		start_idx = (size_t)prune_start;
+	else
+		start_idx = get_interleaved_start_idx(output);
 
-	packet = &output->interleaved_packets.array[idx];
-
-	/* audio packets will almost always come before video packets,
-	 * so it should only ever be necessary to prune audio packets */
-	if (packet->type != OBS_ENCODER_AUDIO)
-		return false;
-
-	next = &output->interleaved_packets.array[idx + 1];
-
-	if (next->type == OBS_ENCODER_VIDEO &&
-	    next->dts_usec == packet->dts_usec)
-		return false;
+	if (start_idx)
+		discard_to_idx(output, start_idx);
 
 	return true;
 }
 
-static void prune_interleaved_packets(struct obs_output *output)
-{
-	size_t start_idx = 0;
-
-	while (can_prune_interleaved_packet(output, start_idx))
-		start_idx++;
-
-	if (start_idx) {
-		for (size_t i = 0; i < start_idx; i++) {
-			struct encoder_packet *packet =
-				&output->interleaved_packets.array[i];
-			obs_free_encoder_packet(packet);
-		}
-
-		da_erase_range(output->interleaved_packets, 0, start_idx);
-	}
-}
-
-static struct encoder_packet *find_first_packet_type(struct obs_output *output,
+static int find_first_packet_type_idx(struct obs_output *output,
 		enum obs_encoder_type type, size_t audio_idx)
 {
 	for (size_t i = 0; i < output->interleaved_packets.num; i++) {
@@ -932,21 +1033,55 @@ static struct encoder_packet *find_first_packet_type(struct obs_output *output,
 				continue;
 			}
 
-			return packet;
+			return (int)i;
 		}
 	}
 
-	return NULL;
+	return -1;
 }
 
-static bool initialize_interleaved_packets(struct obs_output *output)
+static int find_last_packet_type_idx(struct obs_output *output,
+		enum obs_encoder_type type, size_t audio_idx)
 {
-	struct encoder_packet *video;
-	struct encoder_packet *audio[MAX_AUDIO_MIXES];
-	size_t audio_mixes = num_audio_mixes(output);
+	for (size_t i = output->interleaved_packets.num; i > 0; i--) {
+		struct encoder_packet *packet =
+			&output->interleaved_packets.array[i - 1];
 
-	video = find_first_packet_type(output, OBS_ENCODER_VIDEO, 0);
-	if (!video)
+		if (packet->type == type) {
+			if (type == OBS_ENCODER_AUDIO &&
+			    packet->track_idx != audio_idx) {
+				continue;
+			}
+
+			return (int)(i - 1);
+		}
+	}
+
+	return -1;
+}
+
+static inline struct encoder_packet *find_first_packet_type(
+		struct obs_output *output, enum obs_encoder_type type,
+		size_t audio_idx)
+{
+	int idx = find_first_packet_type_idx(output, type, audio_idx);
+	return (idx != -1) ? &output->interleaved_packets.array[idx] : NULL;
+}
+
+static inline struct encoder_packet *find_last_packet_type(
+		struct obs_output *output, enum obs_encoder_type type,
+		size_t audio_idx)
+{
+	int idx = find_last_packet_type_idx(output, type, audio_idx);
+	return (idx != -1) ? &output->interleaved_packets.array[idx] : NULL;
+}
+
+static bool get_audio_and_video_packets(struct obs_output *output,
+		struct encoder_packet **video,
+		struct encoder_packet **audio, size_t audio_mixes)
+{
+	*video = find_first_packet_type(output, OBS_ENCODER_VIDEO, 0);
+	if (!*video)
 		output->received_video = false;
 
 	for (size_t i = 0; i < audio_mixes; i++) {
@@ -957,14 +1092,59 @@ static bool initialize_interleaved_packets(struct obs_output *output)
 		}
 	}
 
-	if (!video) {
+	if (!*video) {
 		return false;
+	}
+
+	return true;
+}
+
+static bool initialize_interleaved_packets(struct obs_output *output)
+{
+	struct encoder_packet *video;
+	struct encoder_packet *audio[MAX_AUDIO_MIXES];
+	struct encoder_packet *last_audio[MAX_AUDIO_MIXES];
+	size_t audio_mixes = num_audio_mixes(output);
+	size_t start_idx;
+
+	if (!get_audio_and_video_packets(output, &video, audio, audio_mixes))
+		return false;
+
+	for (size_t i = 0; i < audio_mixes; i++)
+		last_audio[i] = find_last_packet_type(output, OBS_ENCODER_AUDIO,
+				i);
+
+	/* ensure that there is audio past the first video packet */
+	for (size_t i = 0; i < audio_mixes; i++) {
+		if (last_audio[i]->dts_usec < video->dts_usec) {
+			output->received_audio = false;
+			return false;
+		}
+	}
+
+	/* clear out excess starting audio if it hasn't been already */
+	start_idx = get_interleaved_start_idx(output);
+	if (start_idx) {
+		discard_to_idx(output, start_idx);
+		if (!get_audio_and_video_packets(output, &video, audio,
+					audio_mixes))
+			return false;
 	}
 
 	/* get new offsets */
 	output->video_offset = video->dts;
 	for (size_t i = 0; i < audio_mixes; i++)
 		output->audio_offsets[i] = audio[i]->dts;
+
+#if DEBUG_STARTING_PACKETS == 1
+	int64_t v = video->dts_usec;
+	int64_t a = audio[0]->dts_usec;
+	int64_t diff = v - a;
+
+	blog(LOG_DEBUG, "output '%s' offset for video: %lld, audio: %lld, "
+			"diff: %lldms", output->context.name, v, a,
+			diff / 1000LL);
+#endif
 
 	/* subtract offsets from highest TS offset variables */
 	output->highest_audio_ts -= audio[0]->dts_usec;
@@ -1009,6 +1189,23 @@ static void resort_interleaved_packets(struct obs_output *output)
 	da_free(old_array);
 }
 
+static void discard_unused_audio_packets(struct obs_output *output,
+		int64_t dts_usec)
+{
+	size_t idx = 0;
+
+	for (; idx < output->interleaved_packets.num; idx++) {
+		struct encoder_packet *p =
+			&output->interleaved_packets.array[idx];
+
+		if (p->dts_usec >= dts_usec)
+			break;
+	}
+
+	if (idx)
+		discard_to_idx(output, idx);
+}
+
 static void interleave_packets(void *data, struct encoder_packet *packet)
 {
 	struct obs_output     *output = data;
@@ -1019,6 +1216,15 @@ static void interleave_packets(void *data, struct encoder_packet *packet)
 		packet->track_idx = get_track_index(output, packet);
 
 	pthread_mutex_lock(&output->interleaved_mutex);
+
+	/* if first video frame is not a keyframe, discard until received */
+	if (!output->received_video &&
+	    packet->type == OBS_ENCODER_VIDEO &&
+	    !packet->keyframe) {
+		discard_unused_audio_packets(output, packet->dts_usec);
+		pthread_mutex_unlock(&output->interleaved_mutex);
+		return;
+	}
 
 	was_started = output->received_audio && output->received_video;
 
@@ -1039,10 +1245,11 @@ static void interleave_packets(void *data, struct encoder_packet *packet)
 	 * to start sending out packets (one at a time) */
 	if (output->received_audio && output->received_video) {
 		if (!was_started) {
-			prune_interleaved_packets(output);
-			if (initialize_interleaved_packets(output)) {
-				resort_interleaved_packets(output);
-				send_interleaved(output);
+			if (prune_interleaved_packets(output)) {
+				if (initialize_interleaved_packets(output)) {
+					resort_interleaved_packets(output);
+					send_interleaved(output);
+				}
 			}
 		} else {
 			send_interleaved(output);
@@ -1144,11 +1351,11 @@ static void hook_data_capture(struct obs_output *output, bool encoded,
 			               preserve_active(output) ? "on" : "off");
 		}
 
+		if (has_audio)
+			start_audio_encoders(output, encoded_callback);
 		if (has_video)
 			obs_encoder_start(output->video_encoder,
 					encoded_callback, output);
-		if (has_audio)
-			start_audio_encoders(output, encoded_callback);
 	} else {
 		if (has_video)
 			video_output_connect(output->video,
@@ -1168,12 +1375,14 @@ static inline void signal_start(struct obs_output *output)
 
 static inline void signal_reconnect(struct obs_output *output)
 {
-	struct calldata params = {0};
+	struct calldata params;
+	uint8_t stack[128];
+
+	calldata_init_fixed(&params, stack, sizeof(stack));
 	calldata_set_int(&params, "timeout_sec",
 			output->reconnect_retry_cur_sec);
 	calldata_set_ptr(&params, "output", output);
 	signal_handler_signal(output->context.signals, "reconnect", &params);
-	calldata_free(&params);
 }
 
 static inline void signal_reconnect_success(struct obs_output *output)
@@ -1183,11 +1392,13 @@ static inline void signal_reconnect_success(struct obs_output *output)
 
 static inline void signal_stop(struct obs_output *output, int code)
 {
-	struct calldata params = {0};
+	struct calldata params;
+	uint8_t stack[128];
+
+	calldata_init_fixed(&params, stack, sizeof(stack));
 	calldata_set_int(&params, "code", code);
 	calldata_set_ptr(&params, "output", output);
 	signal_handler_signal(output->context.signals, "stop", &params);
-	calldata_free(&params);
 }
 
 static inline void convert_flags(const struct obs_output *output,
@@ -1235,22 +1446,42 @@ static inline bool initialize_audio_encoders(obs_output_t *output,
 	return true;
 }
 
-static inline bool pair_encoders(obs_output_t *output, size_t num_mixes)
+static inline obs_encoder_t *find_inactive_audio_encoder(obs_output_t *output,
+		size_t num_mixes)
 {
-	if (num_mixes == 1 &&
-	    !output->audio_encoders[0]->active &&
-	    !output->video_encoder->active &&
-	    !output->video_encoder->paired_encoder &&
-	    !output->audio_encoders[0]->paired_encoder) {
+	for (size_t i = 0; i < num_mixes; i++) {
+		struct obs_encoder *audio = output->audio_encoders[i];
 
-		output->audio_encoders[0]->wait_for_video = true;
-		output->audio_encoders[0]->paired_encoder =
-			output->video_encoder;
-		output->video_encoder->paired_encoder =
-			output->audio_encoders[0];
+		if (!audio->active && !audio->paired_encoder)
+			return audio;
 	}
 
-	return true;
+	return NULL;
+}
+
+static inline void pair_encoders(obs_output_t *output, size_t num_mixes)
+{
+	struct obs_encoder *video = output->video_encoder;
+	struct obs_encoder *audio = find_inactive_audio_encoder(output,
+			num_mixes);
+
+	if (video && audio) {
+		pthread_mutex_lock(&audio->init_mutex);
+		pthread_mutex_lock(&video->init_mutex);
+
+		if (!audio->active &&
+		    !video->active &&
+		    !video->paired_encoder &&
+		    !audio->paired_encoder) {
+
+			audio->wait_for_video = true;
+			audio->paired_encoder = video;
+			video->paired_encoder = audio;
+		}
+
+		pthread_mutex_unlock(&video->init_mutex);
+		pthread_mutex_unlock(&audio->init_mutex);
+	}
 }
 
 bool obs_output_initialize_encoders(obs_output_t *output, uint32_t flags)
@@ -1275,11 +1506,8 @@ bool obs_output_initialize_encoders(obs_output_t *output, uint32_t flags)
 	if (has_audio && !initialize_audio_encoders(output, num_mixes))
 		return false;
 
-	if (has_video && has_audio) {
-		if (!pair_encoders(output, num_mixes)) {
-			return false;
-		}
-	}
+	if (has_video && has_audio)
+		pair_encoders(output, num_mixes);
 
 	return true;
 }

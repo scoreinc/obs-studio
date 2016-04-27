@@ -34,6 +34,8 @@
 std::string CurrentTimeString();
 std::string CurrentDateTimeString();
 std::string GenerateTimeDateFilename(const char *extension, bool noSpace=false);
+std::string GenerateSpecifiedFilename(const char *extension, bool noSpace,
+					const char *format);
 QObject *CreateShortcutFilter();
 
 struct BaseLexer {
@@ -151,3 +153,7 @@ static inline int GetProfilePath(char *path, size_t size, const char *file)
 			App()->GetMainWindow());
 	return window->GetProfilePath(path, size, file);
 }
+
+extern bool opt_start_streaming;
+extern bool opt_start_recording;
+extern std::string opt_starting_scene;

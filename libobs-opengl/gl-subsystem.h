@@ -39,7 +39,7 @@ enum copy_type {
 static inline GLint convert_gs_format(enum gs_color_format format)
 {
 	switch (format) {
-	case GS_A8:          return GL_RGBA;
+	case GS_A8:          return GL_RED;
 	case GS_R8:          return GL_RED;
 	case GS_RGBA:        return GL_RGBA;
 	case GS_BGRX:        return GL_BGRA;
@@ -377,7 +377,7 @@ struct gs_vertex_buffer {
 };
 
 extern bool load_vb_buffers(struct gs_program *program,
-		struct gs_vertex_buffer *vb);
+		struct gs_vertex_buffer *vb, struct gs_index_buffer *ib);
 
 struct gs_index_buffer {
 	GLuint               buffer;

@@ -86,6 +86,9 @@ obs_properties_t *XCompcapMain::properties()
 	obs_properties_add_bool(props, "include_border",
 			obs_module_text("IncludeXBorder"));
 
+	obs_properties_add_bool(props, "exclude_alpha",
+			obs_module_text("ExcludeAlpha"));
+
 	return props;
 }
 
@@ -100,6 +103,7 @@ void XCompcapMain::defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "lock_x", false);
 	obs_data_set_default_bool(settings, "show_cursor", true);
 	obs_data_set_default_bool(settings, "include_border", false);
+	obs_data_set_default_bool(settings, "exclude_alpha", false);
 }
 
 
@@ -142,6 +146,7 @@ struct XCompcapMain_private
 	bool swapRedBlue;
 	bool lockX;
 	bool include_border;
+	bool exclude_alpha;
 
 	uint32_t width;
 	uint32_t height;
@@ -234,6 +239,9 @@ static Window getWindowFromString(std::string wstr)
 
 static void xcc_cleanup(XCompcapMain_private *p)
 {
+	PLock lock(&p->lock);
+	XErrorLock xlock;
+
 	if (p->gltex) {
 		gs_texture_destroy(p->gltex);
 		p->gltex = 0;
@@ -284,6 +292,7 @@ void XCompcapMain::updateSettings(obs_data_t *settings)
 		p->swapRedBlue = obs_data_get_bool(settings, "swap_redblue");
 		p->show_cursor = obs_data_get_bool(settings, "show_cursor");
 		p->include_border = obs_data_get_bool(settings, "include_border");
+		p->exclude_alpha = obs_data_get_bool(settings, "exclude_alpha");
 	} else {
 		p->win = prevWin;
 	}
@@ -320,6 +329,10 @@ void XCompcapMain::updateSettings(obs_data_t *settings)
 
 	gs_color_format cf = GS_RGBA;
 
+	if (p->exclude_alpha) {
+		cf = GS_BGRX;
+	}
+
 	p->border = attr.border_width;
 
 	if (p->include_border) {
@@ -351,12 +364,7 @@ void XCompcapMain::updateSettings(obs_data_t *settings)
 
 	uint8_t *texData = new uint8_t[width() * height() * 4];
 
-	for (unsigned int i = 0; i < width() * height() * 4; i += 4) {
-		texData[i + 0] = p->swapRedBlue ? 0 : 0xFF;
-		texData[i + 1] = 0;
-		texData[i + 2] = p->swapRedBlue ? 0xFF : 0;
-		texData[i + 3] = 0xFF;
-	}
+	memset(texData, 0, width() * height() * 4);
 
 	const uint8_t* texDataArr[] = { texData, 0 };
 
@@ -517,6 +525,10 @@ void XCompcapMain::tick(float seconds)
 void XCompcapMain::render(gs_effect_t *effect)
 {
 	PLock lock(&p->lock, true);
+
+	if (!p->win)
+		return;
+
 	effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
 
 	if (!lock.isLocked() || !p->tex)

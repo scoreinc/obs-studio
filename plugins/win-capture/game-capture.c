@@ -381,14 +381,22 @@ static bool check_file_integrity(struct game_capture *gc, const char *file,
 {
 	DWORD error;
 	HANDLE handle;
+	wchar_t *w_file = NULL;
 
 	if (!file || !*file) {
 		warn("Game capture %s not found." STOP_BEING_BAD, name);
 		return false;
 	}
 
-	handle = CreateFileA(file, GENERIC_READ | GENERIC_EXECUTE,
+	if (!os_utf8_to_wcs_ptr(file, 0, &w_file)) {
+		warn("Could not convert file name to wide string");
+		return false;
+	}
+
+	handle = CreateFileW(w_file, GENERIC_READ | GENERIC_EXECUTE,
 			FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+
+	bfree(w_file);
 
 	if (handle != INVALID_HANDLE_VALUE) {
 		CloseHandle(handle);
@@ -822,6 +830,10 @@ static void try_hook(struct game_capture *gc)
 	if (gc->next_window) {
 		gc->thread_id = GetWindowThreadProcessId(gc->next_window,
 				&gc->process_id);
+
+		// Make sure we never try to hook ourselves (projector)
+		if (gc->process_id == GetCurrentProcessId())
+			return;
 
 		if (!gc->thread_id || !gc->process_id) {
 			warn("error acquiring, failed to get window "
@@ -1400,7 +1412,7 @@ static void game_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, SETTING_SCALE_RES, "0x0");
 	obs_data_set_default_bool(settings, SETTING_LIMIT_FRAMERATE, false);
 	obs_data_set_default_bool(settings, SETTING_CAPTURE_OVERLAYS, false);
-	obs_data_set_default_bool(settings, SETTING_ANTI_CHEAT_HOOK, false);
+	obs_data_set_default_bool(settings, SETTING_ANTI_CHEAT_HOOK, true);
 }
 
 static bool any_fullscreen_callback(obs_properties_t *ppts,
@@ -1589,7 +1601,8 @@ static obs_properties_t *game_capture_properties(void *data)
 struct obs_source_info game_capture_info = {
 	.id = "game_capture",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW |
+	                OBS_SOURCE_DO_NOT_DUPLICATE,
 	.get_name = game_capture_name,
 	.create = game_capture_create,
 	.destroy = game_capture_destroy,
